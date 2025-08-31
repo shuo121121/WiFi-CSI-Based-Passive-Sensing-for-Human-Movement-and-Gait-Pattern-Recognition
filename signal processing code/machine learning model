@@ -1,0 +1,166 @@
+import os
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+import seaborn as sns
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+
+
+# Path configuration
+train_dir = '/Users/shawn/esp32-csi-tool/lab/datasetimg/train'
+val_dir = '/Users/shawn/esp32-csi-tool/lab/datasetimg/val'
+
+# hyperparameters
+IMG_SIZE = 224
+BATCH_SIZE = 16
+NUM_CLASSES = 4
+EPOCHS = 30
+LEARNING_RATE = 6e-5
+
+# Data augmentation (training set)
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    rotation_range=10,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    zoom_range=0.1,
+    horizontal_flip=True,
+    fill_mode='nearest'
+)
+
+# The validation set is not augmented; it is only normalised.
+val_datagen = ImageDataGenerator(rescale=1./255)
+
+# Load image
+train_generator = train_datagen.flow_from_directory(
+    train_dir,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode='categorical'
+)
+
+val_generator = val_datagen.flow_from_directory(
+    val_dir,
+    target_size=(IMG_SIZE, IMG_SIZE),
+    batch_size=BATCH_SIZE,
+    class_mode='categorical',
+    shuffle = False
+)
+
+
+# Model construction
+base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(IMG_SIZE, IMG_SIZE, 3))
+base_model.trainable = True
+for layer in base_model.layers[:-15]:
+    layer.trainable = False
+
+# Add category header
+x = base_model.output
+x = GlobalAveragePooling2D()(x)
+x = Dropout(0.6)(x)
+x = Dense(128, activation='relu')(x)
+x = Dropout(0.3)(x)
+predictions = Dense(NUM_CLASSES, activation='softmax')(x)
+
+model = Model(inputs=base_model.input, outputs=predictions)
+
+#  Compilation model
+model.compile(optimizer=Adam(learning_rate=LEARNING_RATE),
+              loss='categorical_crossentropy',
+              metrics=['accuracy'])
+
+
+# Early stop setting
+early_stop = EarlyStopping(
+    monitor='val_accuracy',
+    patience=10,
+    mode='max',
+    restore_best_weights=True,
+    verbose=1
+)
+
+# Model training
+history = model.fit(
+    train_generator,
+    epochs=EPOCHS,
+    validation_data=val_generator,
+    callbacks=[early_stop]
+)
+
+# )
+model.save('my_model6.keras')
+
+# Obtain true labels and predicted labels
+val_generator.reset()
+y_true = val_generator.classes
+y_pred_probs = model.predict(val_generator, verbose=0)
+y_pred = np.argmax(y_pred_probs, axis=1)
+
+# Retrieve category label names
+class_labels = list(val_generator.class_indices.keys())
+
+# --- 1️⃣ Classification Indicator Bar Chart ---
+report = classification_report(y_true, y_pred, target_names=class_labels, output_dict=True)
+
+# Prepare the drawing data
+metrics = ['precision', 'recall', 'f1-score']
+values = {m: [report[cls][m] for cls in class_labels] for m in metrics}
+
+# Create a bar chart
+fig1, ax1 = plt.subplots(figsize=(8, 6))
+x = np.arange(len(class_labels))
+width = 0.25
+
+for i, metric in enumerate(metrics):
+    ax1.bar(x + i * width, values[metric], width, label=metric)
+
+ax1.set_xlabel('Class')
+ax1.set_ylabel('Score')
+ax1.set_title('Per-Class Precision / Recall / F1-score')
+ax1.set_xticks(x + width)
+ax1.set_xticklabels(class_labels)
+ax1.set_ylim(0, 1.05)
+ax1.legend()
+plt.tight_layout()
+
+# --- 2️⃣ Confusion Matrix Diagram ---
+fig2, ax2 = plt.subplots(figsize=(8, 6))
+cm = confusion_matrix(y_true, y_pred)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=class_labels, yticklabels=class_labels, ax=ax2)
+ax2.set_xlabel('Predicted')
+ax2.set_ylabel('True')
+ax2.set_title('Confusion Matrix')
+plt.tight_layout()
+
+# --- 3️⃣ Accuracy curve---
+fig3, ax3 = plt.subplots(figsize=(6, 4))
+ax3.plot(history.history['accuracy'], label='Train acc')
+ax3.plot(history.history['val_accuracy'], label='Val acc')
+ax3.set_title('Training Accuracy')
+ax3.set_xlabel('Epoch')
+ax3.set_ylabel('Accuracy')
+ax3.legend()
+ax3.grid(True)
+plt.tight_layout()
+
+# --- 4️⃣ Loss curve diagram ---
+fig4, ax4 = plt.subplots(figsize=(6, 4))
+ax4.plot(history.history['loss'], label='Train loss')
+ax4.plot(history.history['val_loss'], label='Val loss')
+ax4.set_title('Training Loss')
+ax4.set_xlabel('Epoch')
+ax4.set_ylabel('Loss')
+ax4.legend()
+ax4.grid(True)
+plt.tight_layout()
+
+plt.show()
+
