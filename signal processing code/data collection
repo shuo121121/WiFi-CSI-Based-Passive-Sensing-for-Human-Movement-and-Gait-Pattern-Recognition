@@ -1,0 +1,66 @@
+import serial
+import csv
+import time
+import os 
+
+SERIAL_PORT = '/dev/cu.usbserial-14210'  # ESP32 Serial Port
+BAUD_RATE = 921600
+OUTPUT_FOLDER = '/Users/shawn/esp32-csi-tool/lab/dataset/walking' # Path of the saved folder
+CSV_FILE = 'test.csv'  # File name
+
+def save_serial_to_csv():
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        print(f"📡 Reading from serial port {SERIAL_PORT} and saving to {os.path.join(OUTPUT_FOLDER, CSV_FILE)}...")
+
+        # Ensure the output folder exists
+        os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+        # Construct a complete file path
+        full_path = os.path.join(OUTPUT_FOLDER, CSV_FILE)
+
+        # Get the start time for relative timestamps
+        start_time = time.time()
+
+        with open(full_path, mode='w', newline='') as file:
+            writer = csv.writer(file)
+
+            
+            writer.writerow([
+                'type', 'role', 'mac', 'rssi', 'rate', 'sig_mode', 'mcs', 'bandwidth',
+                'smoothing', 'not_sounding', 'aggregation', 'stbc', 'fec_coding',
+                'sgi', 'noise_floor', 'ampdu_cnt', 'channel', 'secondary_channel',
+                'local_timestamp', 'ant', 'sig_len', 'rx_state', 'real_time_set',
+                'real_timestamp', 'len', 'CSI_DATA'
+            ])
+
+            while True:
+                try:
+                    line = ser.readline().decode(errors='ignore').strip()
+                    if not line:
+                        continue
+
+                    fields = line.split(',', maxsplit=25)
+
+                    # Verify we have enough fields (26 with CSI_DATA being the last)
+                    if len(fields) == 26 and fields[0] == 'CSI_DATA' and '[' in fields[-1] and ']' in fields[-1]:
+                        # Calculate relative timestamp
+                        current_time = time.time()
+                        relative_time = current_time - start_time
+                        fields[-3] = f"{relative_time:.5f}"  # Update real_timestamp
+
+                        # Write to CSV
+                        writer.writerow(fields)
+                        print(f"✅ Write a line, len={fields[-2]}, time={fields[-3]}")
+
+                except Exception as inner_e:
+                    print(f"⚠️ Data parsing error: {inner_e}")
+
+    except KeyboardInterrupt:
+        print("\n🛑 Serial port monitoring has been exited and the CSV file saved.")
+    except Exception as e:
+        print(f"⚠️ Serial port error: {e}")
+
+
+if __name__ == "__main__":
+    save_serial_to_csv()
