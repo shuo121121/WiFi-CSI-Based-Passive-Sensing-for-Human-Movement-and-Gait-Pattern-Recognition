@@ -1,0 +1,186 @@
+# --- Import libraries ---
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import signal
+import pywt
+from sklearn.decomposition import PCA
+from scipy.signal import hilbert, butter, filtfilt
+from scipy.fft import fft, fftfreq
+
+
+# --- Define ALL helper functions ---
+def extract(data):
+    index = list(range(0, len(data) - 1))
+    AmpCSI = np.zeros((len(data), 64))
+    PhaseCSI = np.zeros((len(data), 64))
+
+    for i in index:
+        parts = str(data.loc[:, "CSI_DATA"][i]).split(' ')
+        rawCSI = [s.strip('[') for s in parts]
+        rawCSI.pop()
+        ImCSI = np.array(rawCSI[::2], dtype=np.int64)
+        ReCSI = np.array(rawCSI[1::2], dtype=np.int64)
+        AmpCSI[i][:] = np.sqrt(np.power(ImCSI[:], 2) + np.power(ReCSI[:], 2))
+        PhaseCSI[i][:] = np.arctan2(ImCSI[:], ReCSI[:])
+
+    Amplitude = np.concatenate((AmpCSI[:, 6:32], AmpCSI[:, 33:59]), axis=1)
+    Phase = np.concatenate((PhaseCSI[:, 6:32], PhaseCSI[:, 33:59]), axis=1)
+    UnwrappedPhase = np.unwrap(Phase)
+    timesec = data.loc[:, "real_timestamp"]
+
+    return Amplitude, UnwrappedPhase, timesec
+
+
+def DWT_filter(signal_data, vital, wavelet='db4'):
+    """Discrete Wavelet Transform Denoising"""
+    if vital == "Movement":
+        level = 5
+        coeffs = pywt.wavedec(signal_data, wavelet, level=level)
+        # Calculate the noise standard deviation for each layer
+        sigma = (1 / 0.6745) * np.median(np.abs(coeffs[-level]))
+        # General threshold
+        uthresh = sigma * np.sqrt(2 * np.log(len(signal_data)))
+        # Apply soft threshold
+        coeffs = [pywt.threshold(c, uthresh, mode='soft') for c in coeffs]
+        return pywt.waverec(coeffs, wavelet)
+    else:
+        return signal_data
+
+
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
+    """Bandpass Filter Design"""
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    y = filtfilt(b, a, data)
+    return y
+
+
+def adaptive_threshold(cwt_coeffs):
+    """Time-frequency domain adaptive threshold denoising"""
+    denoised = np.zeros_like(cwt_coeffs)
+    for i in range(cwt_coeffs.shape[0]):
+        sigma = (1 / 0.6745) * np.median(np.abs(cwt_coeffs[i]))
+        threshold = sigma * np.sqrt(2 * np.log(len(cwt_coeffs[i])))*0.7
+        denoised[i] = pywt.threshold(cwt_coeffs[i], threshold, mode='soft')
+    return denoised
+
+
+def plot_frequency_spectrum(signal, fs, title, ax=None):
+    """Plot a spectrum analysis diagram"""
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(10, 4))
+    yf = fft(signal)
+    xf = fftfreq(len(signal), 1 / fs)
+    ax.plot(xf[:len(xf) // 2], np.abs(yf[:len(yf) // 2]))
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel("Amplitude")
+    ax.set_title(title)
+    ax.grid()
+    ax.set_xlim([0, 60])
+
+
+# --- Main Execution ---
+def main():
+    # Load data
+    excel_file = '//Users/shawn/esp32-csi-tool/lab/dataset/sit/test13.csv'
+   
+    data = pd.read_csv(excel_file, on_bad_lines='skip')
+
+    # Extract features
+    Amplitude, UnwrappedPhase, timesec = extract(data)
+
+    # Resample data
+    Duration = int(np.max(timesec) - np.min(timesec))
+    print(f"\nSensing Duration: {Duration} seconds")
+    num_resampled = Duration * 120
+
+    resampled_amplitudes = np.zeros((num_resampled, Amplitude.shape[1]))
+
+    for i in range(Amplitude.shape[1]):
+        resampled_amplitudes[:, i] = signal.resample(Amplitude[:, i], num_resampled)
+    xnew = np.linspace(0, Duration, num_resampled, endpoint=False)
+
+    # DWT denoising
+    filtered_signals = np.zeros_like(resampled_amplitudes)
+    for i in range(resampled_amplitudes.shape[1]):
+        filtered_signals[:, i] = DWT_filter(resampled_amplitudes[:, i], 'Movement')
+
+    # PCA
+    x = pd.DataFrame(filtered_signals)
+    pca = PCA(n_components=1)
+    x_pca = pca.fit_transform(x)
+
+
+    # Bandpass filter (0.75-3.75Hz for walking)
+    fs = 120
+    lowcut = 0.75
+    highcut = 3.75
+    filtered_pca = butter_bandpass_filter(x_pca[:, 0], lowcut, highcut, fs)
+
+
+    # Time-frequency analysis with CWT
+    scales = np.arange(1, 2 ** 8)
+    wavelet = 'morl'
+    coefficients, frequencies = pywt.cwt(filtered_pca, scales, wavelet, sampling_period=1 / fs)
+
+
+    # Steps for Time-Frequency PCA Noise Reduction
+    cwt_matrix = coefficients.T
+    pca_tf = PCA(n_components=min(3, cwt_matrix.shape[1]))  # Ensure that the number of features does not exceed the specified limit.
+    cwt_pca = pca_tf.fit_transform(cwt_matrix)
+
+    # Use all principal components when reconstructing the time-frequency plot.
+    denoised_cwt = pca_tf.inverse_transform(cwt_pca).T  
+
+    # Adaptive thresholding
+    final_coefficients = adaptive_threshold(denoised_cwt)
+    power = np.abs(final_coefficients) / np.max(np.abs(final_coefficients))
+
+    # --- Visualization ---
+
+    # Figure 1: Raw vs Filtered Signal
+    plt.figure(figsize=(12, 4))
+    plt.plot(xnew, x_pca[:, 0], 'b-', alpha=0.5, label='Original PCA')
+    plt.plot(xnew, filtered_pca, 'r-', label=f'Bandpass {lowcut}-{highcut}Hz')
+    plt.xlim([0, 40])
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude')
+    plt.title('PCA signal before and after low-pass filtering')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+
+
+    # Figure 2: Spectrogram
+
+    fig2, ax2 = plt.subplots(figsize=(12, 4))
+    plot_frequency_spectrum(x_pca[:, 0], fs, 'Original PCA Spectrum', ax=ax2)
+    plot_frequency_spectrum(filtered_pca, fs, ' Low Pass Filtered Signal', ax=ax2)
+    # plot_frequency_spectrum(weighted_signal, fs, 'Enhanced Spectrum', ax=ax2)
+    # ax2.legend(['Original', 'Filtered','Enhanced'])
+    ax2.legend(['PCA', 'Filtered'])
+    plt.tight_layout()
+
+
+    # Figure 3: CWT Spectrum
+    plt.figure(figsize=(12, 4))
+    plt.imshow(power, extent=[0, max(xnew), scales[-1], scales[0]],
+               cmap='turbo', aspect='auto', vmax=1)
+    plt.colorbar(label='Normalized Magnitude')
+    plt.yscale('log')
+    plt.ylabel('Scale')
+    plt.xlabel('Time (s)')
+    plt.title(f'Denoised Scalogram ({lowcut}-{highcut}Hz)')
+    plt.tight_layout()
+
+
+    plt.show()
+
+
+
+
+if __name__ == "__main__":
+    main()
